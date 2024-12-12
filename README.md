@@ -1,0 +1,2 @@
+# whisper_utils
+Whisperで自動音声認識を行うライブラリ
