@@ -6,18 +6,17 @@ import torch
 import gc
 from typing import List, Optional
 
-# 特定の警告を抑制
+# 警告の抑制
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# PyTorchのメモリ管理設定
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 class WhisperTranscriber:
     def __init__(self, model_size: str = "large", device: Optional[str] = None, chunk_length: int = 60):
         """
         WhisperTranscriberの初期化
-        
-        Args:
-            model_size (str): Whisperモデルのサイズ ("tiny", "base", "small", "medium", "large")
-            device (Optional[str]): 使用するデバイス。Noneの場合は自動検出
-            chunk_length (int): 音声分割の長さ（秒）
         """
         self.model_size = model_size
         self.device = self._detect_device() if device is None else device
@@ -26,19 +25,23 @@ class WhisperTranscriber:
         self._setup_device()
         
     def _detect_device(self) -> str:
-        """
-        利用可能なデバイスを自動検出
-        
-        Returns:
-            str: "cuda" または "cpu"
-        """
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        """利用可能なデバイスを自動検出"""
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory
+            if gpu_memory < 8 * 1024 * 1024 * 1024:
+                print("Warning: Limited GPU memory detected. Using CPU instead.")
+                return "cpu"
+            return "cuda"
+        return "cpu"
 
     def _setup_device(self) -> None:
         """デバイスの設定を初期化"""
         if self.device == "cuda":
             torch.cuda.empty_cache()
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+            available_memory = torch.cuda.get_device_properties(0).total_memory
+            if self.model_size == "large" and available_memory < 8 * 1024 * 1024 * 1024:
+                print("Warning: Insufficient GPU memory for large model. Switching to medium model.")
+                self.model_size = "medium"
         print(f"Using device: {self.device}")
 
     def _release_memory(self) -> None:
@@ -54,37 +57,41 @@ class WhisperTranscriber:
         """Whisperモデルをロード"""
         self._release_memory()
         print(f"Loading Whisper {self.model_size} model...")
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore")
-            self.model = whisper.load_model(self.model_size, device=self.device)
-        print("Model loaded successfully.")
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FutureWarning)
+                self.model = whisper.load_model(
+                    self.model_size, 
+                    device=self.device,
+                    download_root=None,
+                    in_memory=True
+                )
+            print("Model loaded successfully.")
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("GPU memory error during model loading. Switching to CPU...")
+                self.device = "cpu"
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    self.model = whisper.load_model(
+                        self.model_size, 
+                        device=self.device,
+                        download_root=None,
+                        in_memory=True
+                    )
+                print("Model loaded successfully on CPU.")
 
     def _split_audio(self, audio_path: str) -> List[AudioSegment]:
-        """
-        音声ファイルを指定した長さに分割
-        
-        Args:
-            audio_path (str): 音声ファイルのパス
-            
-        Returns:
-            List[AudioSegment]: 分割された音声セグメントのリスト
-        """
+        """音声ファイルを分割"""
         audio = AudioSegment.from_file(audio_path)
         chunks = []
         for i in range(0, len(audio), self.chunk_length * 1000):
             chunks.append(audio[i:i + self.chunk_length * 1000])
         return chunks
 
-    def transcribe_file(self, audio_path: str, output_dir: Optional[str] = None) -> str:
+    def transcribe(self, audio_path: str, output_dir: Optional[str] = None) -> str:
         """
         音声ファイルを文字起こし
-        
-        Args:
-            audio_path (str): 音声ファイルのパス
-            output_dir (Optional[str]): 出力ディレクトリ（Noneの場合は音声ファイルと同じディレクトリ）
-            
-        Returns:
-            str: 文字起こしされたテキスト
         """
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -92,7 +99,6 @@ class WhisperTranscriber:
         if self.model is None:
             self.load_model()
 
-        # 出力ディレクトリの設定
         if output_dir is None:
             output_dir = os.path.dirname(audio_path)
         os.makedirs(output_dir, exist_ok=True)
@@ -108,16 +114,28 @@ class WhisperTranscriber:
             print(f"Processing chunk {i}/{len(chunks)}...")
             chunk_path = os.path.join(temp_dir, f"temp_chunk_{i}.mp3")
             try:
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+                
                 chunk.export(chunk_path, format="mp3")
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore")
-                    result = self.model.transcribe(chunk_path)
+                result = self.model.transcribe(chunk_path)
                 transcript += result["text"] + "\n"
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"GPU memory error on chunk {i}. Switching to CPU...")
+                    self._release_memory()
+                    self.device = "cpu"
+                    self.model = whisper.load_model(self.model_size, device=self.device)
+                    result = self.model.transcribe(chunk_path)
+                    transcript += result["text"] + "\n"
+                else:
+                    raise e
             finally:
                 if os.path.exists(chunk_path):
                     os.remove(chunk_path)
+                gc.collect()
 
-        # 結果の保存
         filename = os.path.basename(audio_path)
         txt_filename = os.path.splitext(filename)[0] + ".txt"
         txt_path = os.path.join(output_dir, txt_filename)
@@ -129,13 +147,7 @@ class WhisperTranscriber:
         return transcript
 
     def process_directory(self, audio_dir: str, output_dir: Optional[str] = None) -> None:
-        """
-        ディレクトリ内の全音声ファイルを処理
-        
-        Args:
-            audio_dir (str): 音声ファイルのディレクトリ
-            output_dir (Optional[str]): 出力ディレクトリ（Noneの場合は音声ファイルと同じディレクトリ）
-        """
+        """ディレクトリ内の全音声ファイルを処理"""
         if not os.path.exists(audio_dir):
             raise FileNotFoundError(f"Directory not found: {audio_dir}")
 
@@ -147,13 +159,14 @@ class WhisperTranscriber:
             if filename.lower().endswith((".mp3", ".wav", ".m4a")):
                 audio_path = os.path.join(audio_dir, filename)
                 print(f"\nProcessing: {filename}")
-                self.transcribe_file(audio_path, output_dir)
-                print(f"Completed: {filename}")
+                try:
+                    self.transcribe(audio_path, output_dir)
+                    print(f"Completed: {filename}")
+                except Exception as e:
+                    print(f"Error processing {filename}: {str(e)}")
+                    continue
 
 def main():
-    """
-    コマンドライン引数を使用してWhisperTranscriberをテストするためのメイン関数
-    """
     import argparse
     
     parser = argparse.ArgumentParser(description='Whisper音声文字起こしユーティリティ')
@@ -172,15 +185,6 @@ def main():
     
     args = parser.parse_args()
     
-    # 入力パスの検証を追加
-    if not args.input:
-        print("Error: Input file path is empty. Please specify a valid file path.")
-        return
-        
-    # 絶対パスに変換
-    input_path = os.path.abspath(args.input)
-    output_path = os.path.abspath(args.output) if args.output else None
-    
     try:
         transcriber = WhisperTranscriber(
             model_size=args.model,
@@ -188,23 +192,21 @@ def main():
             chunk_length=args.chunk
         )
         
-        if os.path.isfile(input_path):
-            print(f"Processing file: {input_path}")
-            transcript = transcriber.transcribe_file(input_path, output_path)
+        if os.path.isfile(args.input):
+            print(f"Processing file: {os.path.abspath(args.input)}")
+            transcriber.transcribe(args.input, args.output)
             print("Processing completed successfully.")
-        elif os.path.isdir(input_path):
-            print(f"Processing directory: {input_path}")
-            transcriber.process_directory(input_path, output_path)
+        elif os.path.isdir(args.input):
+            print(f"Processing directory: {os.path.abspath(args.input)}")
+            transcriber.process_directory(args.input, args.output)
             print("Directory processing completed successfully.")
         else:
-            print(f"Error: Input path does not exist: {input_path}")
-            print("Please check the file path and try again.")
+            print(f"Error: Input path {args.input} does not exist.")
             return
-    
+
     except Exception as e:
         print(f"Error occurred: {str(e)}")
         print("Please make sure the file path is correct and the file exists.")
-        return
-    
+
 if __name__ == '__main__':
     main()
