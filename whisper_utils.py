@@ -26,8 +26,9 @@ class WhisperTranscriber:
        """
        # GPUメモリの使用を制限する設定
        if torch.cuda.is_available():
-           torch.cuda.set_per_process_memory_fraction(0.7)  # GPU使用量を70%に制限
            torch.cuda.empty_cache()
+           gc.collect()
+           torch.cuda.set_per_process_memory_fraction(0.9)  # GPU使用量を90%に制限
 
        self.model_size = model_size
        self.device = self._detect_device() if device is None else device
@@ -45,8 +46,8 @@ class WhisperTranscriber:
        """デバイスの設定を初期化"""
        if self.device == "cuda":
            torch.cuda.empty_cache()
-           torch.backends.cuda.max_memory_allocated = 4 * 1024 * 1024 * 1024  # 4GB制限
-           print(f"Using device: {self.device} (Memory usage limited to 70%)")
+           torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024  # 4GB制限
+           print(f"Using device: {self.device} (Memory usage limited to 90%)")
        else:
            print(f"Using device: {self.device}")
 
