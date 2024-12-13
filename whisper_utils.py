@@ -1,3 +1,5 @@
+# whisper_utils.py
+
 import os
 import warnings
 from pydub import AudioSegment
@@ -16,20 +18,13 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collectio
 
 class WhisperTranscriber:
    def __init__(self, model_size: str = "large", device: Optional[str] = None, chunk_length: int = 60):
-       """
-       WhisperTranscriberの初期化
-       
-       Args:
-           model_size (str): Whisperモデルのサイズ ("tiny", "base", "small", "medium", "large")
-           device (Optional[str]): 使用するデバイス。Noneの場合は自動検出
-           chunk_length (int): 音声分割の長さ（秒）
-       """
-       # 初期化時にGPUメモリを完全にクリア
        if torch.cuda.is_available():
-           torch.cuda.empty_cache()
-           gc.collect()
-           # メモリ使用制限を緩める（90%まで使用可能に）
+           with torch.cuda.device("cuda"):
+               torch.cuda.empty_cache()
+               torch.cuda.reset_peak_memory_stats()
+               gc.collect()
            torch.cuda.set_per_process_memory_fraction(0.9)
+           print("Initial GPU memory cleared")
 
        self.model_size = model_size
        self.device = self._detect_device() if device is None else device
@@ -38,48 +33,43 @@ class WhisperTranscriber:
        self._setup_device()
 
    def _detect_device(self) -> str:
-       """利用可能なデバイスを自動検出"""
        if torch.cuda.is_available():
            return "cuda"
        return "cpu"
 
    def _setup_device(self) -> None:
-       """デバイスの設定を初期化"""
        if self.device == "cuda":
-           torch.cuda.empty_cache()
-           # メモリ制限を緩和（6GB）
+           with torch.cuda.device("cuda"):
+               torch.cuda.empty_cache()
            torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024
            print(f"Using device: {self.device} (Memory usage limited to 90%)")
        else:
            print(f"Using device: {self.device}")
 
-   def _clear_gpu_memory(self) -> None:
-       """GPUメモリを完全にクリア"""
-       if torch.cuda.is_available():
-           torch.cuda.empty_cache()
-           torch.cuda.reset_peak_memory_stats()
-           gc.collect()
-           print("GPU memory cleared")
-
    def _release_memory(self) -> None:
-       """メモリを解放"""
        if self.model is not None:
            del self.model
            self.model = None
        gc.collect()
        if self.device == "cuda":
-           torch.cuda.empty_cache()
+           with torch.cuda.device("cuda"):
+               torch.cuda.empty_cache()
 
    def load_model(self) -> None:
-       """Whisperモデルをロード"""
        self._release_memory()
-       self._clear_gpu_memory()  # 追加：メモリクリアを徹底
+       
+       if torch.cuda.is_available():
+           with torch.cuda.device("cuda"):
+               torch.cuda.empty_cache()
+               torch.cuda.reset_peak_memory_stats()
+               gc.collect()
+           print("GPU memory cleared before model loading")
+
        initial_device = self.device
        initial_model = self.model_size
        print(f"Attempting to load Whisper {self.model_size} model on {self.device.upper()}...")
        
        try:
-           # GPU使用量制限を一時的に緩和
            if self.device == "cuda":
                torch.cuda.set_per_process_memory_fraction(0.9)
            
@@ -97,7 +87,11 @@ class WhisperTranscriber:
        except RuntimeError as e:
            if "out of memory" in str(e):
                if self.device == "cuda":
-                   self._clear_gpu_memory()  # 追加：エラー発生時もクリア
+                   with torch.cuda.device("cuda"):
+                       torch.cuda.empty_cache()
+                       torch.cuda.reset_peak_memory_stats()
+                       gc.collect()
+                   
                    if self.model_size == "large":
                        print("GPU memory error with large model. Trying medium model on GPU...")
                        self.model_size = "medium"
@@ -113,15 +107,6 @@ class WhisperTranscriber:
                raise e
 
    def _split_audio(self, audio_path: str) -> List[AudioSegment]:
-       """
-       音声ファイルを指定した長さに分割
-       
-       Args:
-           audio_path (str): 音声ファイルのパス
-           
-       Returns:
-           List[AudioSegment]: 分割された音声セグメントのリスト
-       """
        audio = AudioSegment.from_file(audio_path)
        chunks = []
        for i in range(0, len(audio), self.chunk_length * 1000):
@@ -129,7 +114,6 @@ class WhisperTranscriber:
        return chunks
 
    def transcribe(self, audio_path: str, output_dir: Optional[str] = None) -> str:
-       """音声ファイルを文字起こし"""
        try:
            if not os.path.exists(audio_path):
                raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -158,7 +142,8 @@ class WhisperTranscriber:
                chunk_path = os.path.join(temp_dir, f"temp_chunk_{i}.mp3")
                try:
                    if self.device == "cuda":
-                       torch.cuda.empty_cache()
+                       with torch.cuda.device("cuda"):
+                           torch.cuda.empty_cache()
                        memory_allocated = torch.cuda.memory_allocated(0)
                        memory_reserved = torch.cuda.memory_reserved(0)
                        print(f"GPU Memory: Allocated = {memory_allocated/1024**2:.1f}MB, "
@@ -172,7 +157,8 @@ class WhisperTranscriber:
                    if "out of memory" in str(e) and self.device == "cuda":
                        print(f"GPU memory error on chunk {i}, but continuing with current configuration...")
                        self._release_memory()
-                       torch.cuda.empty_cache()
+                       with torch.cuda.device("cuda"):
+                           torch.cuda.empty_cache()
                        result = self.model.transcribe(chunk_path)
                        transcript += result["text"] + "\n"
                    else:
@@ -197,13 +183,6 @@ class WhisperTranscriber:
            raise
 
    def process_directory(self, audio_dir: str, output_dir: Optional[str] = None) -> None:
-       """
-       ディレクトリ内の全音声ファイルを処理
-       
-       Args:
-           audio_dir (str): 音声ファイルのディレクトリ
-           output_dir (Optional[str]): 出力ディレクトリ（Noneの場合は音声ファイルと同じディレクトリ）
-       """
        if not os.path.exists(audio_dir):
            raise FileNotFoundError(f"Directory not found: {audio_dir}")
 
