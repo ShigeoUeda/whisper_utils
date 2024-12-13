@@ -15,13 +15,12 @@ warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 class WhisperTranscriber:
-   def __init__(self, model_size: str = "large-v3", device: Optional[str] = None, chunk_length: int = 60):
+   def __init__(self, model_size: str = "large", device: Optional[str] = None, chunk_length: int = 60):
        """
        WhisperTranscriberの初期化
        
        Args:
-           model_size (str): Whisperモデルのサイズ 
-               ("tiny", "base", "small", "medium", "large", "large-v1", "large-v2", "large-v3")
+           model_size (str): Whisperモデルのサイズ ("tiny", "base", "small", "medium", "large")
            device (Optional[str]): 使用するデバイス。Noneの場合は自動検出
            chunk_length (int): 音声分割の長さ（秒）
        """
@@ -39,7 +38,6 @@ class WhisperTranscriber:
    def _detect_device(self) -> str:
        """利用可能なデバイスを自動検出"""
        if torch.cuda.is_available():
-           # GPUが利用可能な場合は常にGPUを使用
            return "cuda"
        return "cpu"
 
@@ -47,7 +45,6 @@ class WhisperTranscriber:
        """デバイスの設定を初期化"""
        if self.device == "cuda":
            torch.cuda.empty_cache()
-           # メモリ使用量を制限しつつGPUを使用
            torch.backends.cuda.max_memory_allocated = 4 * 1024 * 1024 * 1024  # 4GB制限
            print(f"Using device: {self.device} (Memory usage limited to 70%)")
        else:
@@ -65,8 +62,12 @@ class WhisperTranscriber:
    def load_model(self) -> None:
        """Whisperモデルをロード"""
        self._release_memory()
-       print(f"Loading Whisper {self.model_size} model...")
+       initial_device = self.device
+       initial_model = self.model_size
+       print(f"Attempting to load Whisper {self.model_size} model on {self.device.upper()}...")
+       
        try:
+           # まずは指定された設定で試行
            with warnings.catch_warnings():
                warnings.filterwarnings("ignore", category=FutureWarning)
                warnings.filterwarnings("ignore", category=UserWarning)
@@ -77,32 +78,25 @@ class WhisperTranscriber:
                    in_memory=True
                )
            print(f"Model loaded successfully on {self.device.upper()}")
+       
        except RuntimeError as e:
            if "out of memory" in str(e):
-               print(f"GPU memory error during model loading with {self.model_size} model.")
-               if self.model_size.startswith("large"):
-                   if self.model_size == "large-v3":
-                       print("Attempting to load large-v2 model instead...")
-                       self.model_size = "large-v2"
-                   elif self.model_size == "large-v2":
-                       print("Attempting to load large-v1 model instead...")
-                       self.model_size = "large-v1"
-                   elif self.model_size in ["large-v1", "large"]:
-                       print("Attempting to load medium model instead...")
+               if self.device == "cuda":
+                   if self.model_size == "large":
+                       # GPU-largeが失敗したらGPU-mediumを試行
+                       print("GPU memory error with large model. Trying medium model on GPU...")
                        self.model_size = "medium"
-                   self.load_model()  # 再帰的に小さいモデルを試行
+                       self.load_model()
+                   else:
+                       # GPU-mediumが失敗したらCPU-largeを試行
+                       print("GPU memory error with medium model. Switching to large model on CPU...")
+                       self.device = "cpu"
+                       self.model_size = initial_model  # 元のモデルサイズに戻す
+                       self.load_model()
                else:
-                   print("Switching to CPU...")
-                   self.device = "cpu"
-                   with warnings.catch_warnings():
-                       warnings.filterwarnings("ignore")
-                       self.model = whisper.load_model(
-                           self.model_size, 
-                           device=self.device,
-                           download_root=None,
-                           in_memory=True
-                       )
-                   print(f"Model loaded successfully on {self.device.upper()}")
+                   raise RuntimeError(f"Unable to load {self.model_size} model on {self.device}")
+           else:
+               raise e
 
    def _split_audio(self, audio_path: str) -> List[AudioSegment]:
        """
@@ -133,7 +127,6 @@ class WhisperTranscriber:
                output_dir = os.path.dirname(audio_path)
            os.makedirs(output_dir, exist_ok=True)
 
-           # 音声ファイルを読み込み
            print(f"Reading audio file: {audio_path}")
            try:
                audio_segments = self._split_audio(audio_path)
@@ -163,7 +156,7 @@ class WhisperTranscriber:
                    
                except RuntimeError as e:
                    if "out of memory" in str(e) and self.device == "cuda":
-                       print(f"GPU memory error on chunk {i}, but continuing with GPU...")
+                       print(f"GPU memory error on chunk {i}, but continuing with current configuration...")
                        self._release_memory()
                        torch.cuda.empty_cache()
                        result = self.model.transcribe(chunk_path)
@@ -175,7 +168,6 @@ class WhisperTranscriber:
                        os.remove(chunk_path)
                    gc.collect()
 
-           # 結果の保存
            filename = os.path.basename(audio_path)
            txt_filename = os.path.splitext(filename)[0] + ".txt"
            txt_path = os.path.join(output_dir, txt_filename)
@@ -225,8 +217,7 @@ def main():
    parser.add_argument('--output', '-o', 
                      help='出力ディレクトリのパス（指定がない場合は入力と同じディレクトリ）')
    parser.add_argument('--model', '-m', default='large',
-                     choices=['tiny', 'base', 'small', 'medium', 
-                             'large', 'large-v1', 'large-v2', 'large-v3'],
+                     choices=['tiny', 'base', 'small', 'medium', 'large'],
                      help='使用するWhisperモデルのサイズ（デフォルト: large）')
    parser.add_argument('--device',
                      choices=['cuda', 'cpu'],
