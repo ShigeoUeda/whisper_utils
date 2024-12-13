@@ -9,6 +9,7 @@ from typing import List, Optional
 # 警告の抑制
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # PyTorchのメモリ管理設定
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
@@ -19,13 +20,14 @@ class WhisperTranscriber:
        WhisperTranscriberの初期化
        
        Args:
-           model_size (str): Whisperモデルのサイズ ("tiny", "base", "small", "medium", "large")
+           model_size (str): Whisperモデルのサイズ 
+               ("tiny", "base", "small", "medium", "large", "large-v1", "large-v2", "large-v3")
            device (Optional[str]): 使用するデバイス。Noneの場合は自動検出
            chunk_length (int): 音声分割の長さ（秒）
        """
        # GPUメモリの使用を制限する設定
        if torch.cuda.is_available():
-           torch.cuda.set_per_process_memory_fraction(0.7)  # GPU使用量を70%に制限
+           torch.cuda.set_per_process_memory_fraction(0.6)  # GPU使用量を60%に制限
            torch.cuda.empty_cache()
 
        self.model_size = model_size
@@ -67,26 +69,40 @@ class WhisperTranscriber:
        try:
            with warnings.catch_warnings():
                warnings.filterwarnings("ignore", category=FutureWarning)
+               warnings.filterwarnings("ignore", category=UserWarning)
                self.model = whisper.load_model(
                    self.model_size, 
                    device=self.device,
                    download_root=None,
                    in_memory=True
                )
-           print("Model loaded successfully.")
+           print(f"Model loaded successfully on {self.device.upper()}")
        except RuntimeError as e:
            if "out of memory" in str(e):
-               print("GPU memory error during model loading. Switching to CPU...")
-               self.device = "cpu"
-               with warnings.catch_warnings():
-                   warnings.filterwarnings("ignore", category=FutureWarning)
-                   self.model = whisper.load_model(
-                       self.model_size, 
-                       device=self.device,
-                       download_root=None,
-                       in_memory=True
-                   )
-               print("Model loaded successfully on CPU.")
+               print(f"GPU memory error during model loading with {self.model_size} model.")
+               if self.model_size.startswith("large"):
+                   if self.model_size == "large-v3":
+                       print("Attempting to load large-v2 model instead...")
+                       self.model_size = "large-v2"
+                   elif self.model_size == "large-v2":
+                       print("Attempting to load large-v1 model instead...")
+                       self.model_size = "large-v1"
+                   elif self.model_size in ["large-v1", "large"]:
+                       print("Attempting to load medium model instead...")
+                       self.model_size = "medium"
+                   self.load_model()  # 再帰的に小さいモデルを試行
+               else:
+                   print("Switching to CPU...")
+                   self.device = "cpu"
+                   with warnings.catch_warnings():
+                       warnings.filterwarnings("ignore")
+                       self.model = whisper.load_model(
+                           self.model_size, 
+                           device=self.device,
+                           download_root=None,
+                           in_memory=True
+                       )
+                   print(f"Model loaded successfully on {self.device.upper()}")
 
    def _split_audio(self, audio_path: str) -> List[AudioSegment]:
        """
@@ -209,8 +225,9 @@ def main():
    parser.add_argument('--output', '-o', 
                      help='出力ディレクトリのパス（指定がない場合は入力と同じディレクトリ）')
    parser.add_argument('--model', '-m', default='large',
-                     choices=['tiny', 'base', 'small', 'medium', 'large'],
-                     help='使用するWhisperモデルのサイズ（デフォルト: large）')
+                     choices=['tiny', 'base', 'small', 'medium', 
+                             'large', 'large-v1', 'large-v2', 'large-v3'],
+                     help='使用するWhisperモデルのサイズ（デフォルト: large-v3）')
    parser.add_argument('--device',
                      choices=['cuda', 'cpu'],
                      help='使用するデバイス（未指定の場合は自動検出）')
