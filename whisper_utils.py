@@ -24,11 +24,12 @@ class WhisperTranscriber:
            device (Optional[str]): 使用するデバイス。Noneの場合は自動検出
            chunk_length (int): 音声分割の長さ（秒）
        """
-       # GPUメモリの使用を制限する設定
+       # 初期化時にGPUメモリを完全にクリア
        if torch.cuda.is_available():
            torch.cuda.empty_cache()
            gc.collect()
-           torch.cuda.set_per_process_memory_fraction(0.9)  # GPU使用量を90%に制限
+           # メモリ使用制限を緩める（90%まで使用可能に）
+           torch.cuda.set_per_process_memory_fraction(0.9)
 
        self.model_size = model_size
        self.device = self._detect_device() if device is None else device
@@ -46,10 +47,19 @@ class WhisperTranscriber:
        """デバイスの設定を初期化"""
        if self.device == "cuda":
            torch.cuda.empty_cache()
-           torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024  # 4GB制限
+           # メモリ制限を緩和（6GB）
+           torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024
            print(f"Using device: {self.device} (Memory usage limited to 90%)")
        else:
            print(f"Using device: {self.device}")
+
+   def _clear_gpu_memory(self) -> None:
+       """GPUメモリを完全にクリア"""
+       if torch.cuda.is_available():
+           torch.cuda.empty_cache()
+           torch.cuda.reset_peak_memory_stats()
+           gc.collect()
+           print("GPU memory cleared")
 
    def _release_memory(self) -> None:
        """メモリを解放"""
@@ -63,12 +73,16 @@ class WhisperTranscriber:
    def load_model(self) -> None:
        """Whisperモデルをロード"""
        self._release_memory()
+       self._clear_gpu_memory()  # 追加：メモリクリアを徹底
        initial_device = self.device
        initial_model = self.model_size
        print(f"Attempting to load Whisper {self.model_size} model on {self.device.upper()}...")
        
        try:
-           # まずは指定された設定で試行
+           # GPU使用量制限を一時的に緩和
+           if self.device == "cuda":
+               torch.cuda.set_per_process_memory_fraction(0.9)
+           
            with warnings.catch_warnings():
                warnings.filterwarnings("ignore", category=FutureWarning)
                warnings.filterwarnings("ignore", category=UserWarning)
@@ -83,16 +97,15 @@ class WhisperTranscriber:
        except RuntimeError as e:
            if "out of memory" in str(e):
                if self.device == "cuda":
+                   self._clear_gpu_memory()  # 追加：エラー発生時もクリア
                    if self.model_size == "large":
-                       # GPU-largeが失敗したらGPU-mediumを試行
                        print("GPU memory error with large model. Trying medium model on GPU...")
                        self.model_size = "medium"
                        self.load_model()
                    else:
-                       # GPU-mediumが失敗したらCPU-largeを試行
                        print("GPU memory error with medium model. Switching to large model on CPU...")
                        self.device = "cpu"
-                       self.model_size = initial_model  # 元のモデルサイズに戻す
+                       self.model_size = initial_model
                        self.load_model()
                else:
                    raise RuntimeError(f"Unable to load {self.model_size} model on {self.device}")
