@@ -25,12 +25,15 @@ ffmpeg --version
 
 ## 実行
 
+※できるだけモデル指定をしてください。
+自動切り替えの機能はありますが、直接指定するほうがメモリ使用量が減ります。また、GPUメモリが8Gibではlargeの起動は難しいようです。
+
 ```sh
 # カレントディレクトリに音声ファイルがある場合
-python whisper_utils.py -i ./audio.mp3
+python whisper_utils.py -i ./audio.mp3 -m medium
 
 # 絶対パスで音声ファイルを指定する場合
-python whisper_utils.py -i /full/path/to/audio.mp3
+python whisper_utils.py -i /full/path/to/audio.mp3 -m large
 
 # サブディレクトリに音声ファイルがある場合
 python whisper_utils.py -i ./subfolder/audio.mp3
