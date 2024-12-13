@@ -1,12 +1,16 @@
+"""
+GPUメモリを効率的に管理しながらWhisperモデルを使用する音声文字起こしユーティリティ。
+メモリ不足時には代替の実行方法を提案します。
+"""
 import os
 import warnings
 from pydub import AudioSegment
 import whisper
 import torch
 import gc
-from typing import List, Optional, NoReturn
+from typing import List, Optional, NoReturn, Any, Dict
 
-# 警告の抑制（CPU関連、Future Warning、User Warning）
+# 警告の抑制
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -16,32 +20,33 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collectio
 
 class WhisperTranscriber:
    """
-   WhisperモデルによるGPUメモリ最適化された音声文字起こしクラス
+   Whisperモデルを使用した音声文字起こしクラス
    
    Attributes:
        model_size (str): Whisperモデルのサイズ ("tiny", "base", "small", "medium", "large")
        device (str): 使用するデバイス ("cuda" または "cpu")
        chunk_length (int): 音声分割の長さ（秒）
-       model: ロードされたWhisperモデルのインスタンス
+       model (Optional[Any]): ロードされたWhisperモデルのインスタンス
    """
-   
+
    def __init__(self, model_size: str = "large", device: Optional[str] = None, chunk_length: int = 60) -> None:
        """
-       初期化メソッド
+       WhisperTranscriberの初期化
        
        Args:
-           model_size: Whisperモデルのサイズ ("tiny", "base", "small", "medium", "large")
-           device: 使用するデバイス ("cuda" または "cpu")。Noneの場合は自動検出
+           model_size: Whisperモデルのサイズ
+           device: 使用するデバイス（未指定時は自動検出）
            chunk_length: 音声分割の長さ（秒）
        """
        if torch.cuda.is_available():
-           self._reset_cuda()
-           print("Initial GPU memory cleared")
+           torch.cuda.empty_cache()
+           gc.collect()
+           torch.cuda.set_per_process_memory_fraction(0.9)
 
        self.model_size = model_size
        self.device = self._detect_device() if device is None else device
        self.chunk_length = chunk_length
-       self.model = None
+       self.model: Optional[Any] = None
        self._setup_device()
 
    def _detect_device(self) -> str:
@@ -57,95 +62,53 @@ class WhisperTranscriber:
 
    def _setup_device(self) -> None:
        """
-       デバイスの初期設定を行う
-       
-       GPU使用時はメモリ制限とキャッシュクリアを設定
+       デバイスの初期設定
        """
        if self.device == "cuda":
-           self._reset_cuda()
-           torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024
-           print(f"Using device: {self.device} (Memory usage limited to 90%)")
+           torch.cuda.empty_cache()
+           print(f"Using device: {self.device}")
        else:
            print(f"Using device: {self.device}")
 
-   def _reset_cuda(self) -> None:
+   def _clear_memory(self) -> None:
        """
-       CUDA環境を完全にリセット
-       
-       - モデルの解放
-       - メモリキャッシュのクリア
-       - CUDAコンテキストの再初期化
-       - ガベージコレクションの実行
+       メモリの解放とクリーンアップを実行
        """
-       if torch.cuda.is_available():
-           # 既存のモデルを解放
-           if hasattr(self, 'model') and self.model is not None:
-               del self.model
-               self.model = None
-           
-           # すべての未解放のメモリを解放
-           gc.collect()
-           
-           # CUDAキャッシュとメモリ統計をリセット
-           with torch.cuda.device("cuda"):
-               torch.cuda.empty_cache()
-               torch.cuda.reset_peak_memory_stats()
-               torch.cuda.reset_accumulated_memory_stats()
-               torch.cuda.reset_max_memory_allocated()
-               torch.cuda.synchronize()
-           
-           # CUDAコンテキストを再初期化
-           torch.cuda.ipc_collect()
-           cuda_device = torch.device("cuda")
-           torch.cuda.device(cuda_device)
-           
-           # GPU使用量を90%に制限
-           torch.cuda.set_per_process_memory_fraction(0.9)
-           
-           # 強制的にガベージコレクションを複数回実行
-           for _ in range(3):
-               gc.collect()
+       if self.model is not None:
+           del self.model
+           self.model = None
+       gc.collect()
+       if self.device == "cuda":
+           torch.cuda.empty_cache()
 
    def load_model(self) -> None:
        """
        Whisperモデルをロード
        
-       メモリ不足時は自動的にモデルサイズを調整:
-       large (GPU) -> medium (GPU) -> large (CPU)
-       
        Raises:
-           RuntimeError: モデルのロードに失敗した場合
+           RuntimeError: GPUメモリ不足時やモデルロード失敗時
        """
+       self._clear_memory()
+       print(f"Attempting to load Whisper {self.model_size} model on {self.device.upper()}...")
+       
        try:
-           self._reset_cuda()
-           print(f"Attempting to load Whisper {self.model_size} model on {self.device.upper()}...")
-           
-           if self.device == "cuda":
-               self._reset_cuda()
-           
            with warnings.catch_warnings():
                warnings.filterwarnings("ignore")
                self.model = whisper.load_model(
                    self.model_size, 
-                   device=self.device,
-                   download_root=None,
-                   in_memory=True
+                   device=self.device
                )
            print(f"Model loaded successfully on {self.device.upper()}")
        
        except RuntimeError as e:
            if "out of memory" in str(e) and self.device == "cuda":
-               self._reset_cuda()
-               
-               if self.model_size == "large":
-                   print("GPU memory error with large model. Trying medium model on GPU...")
-                   self.model_size = "medium"
-                   self.load_model()
-               else:
-                   print("GPU memory error with medium model. Switching to large model on CPU...")
-                   self.device = "cpu"
-                   self.model_size = "large"
-                   self.load_model()
+               print("\nGPU memory error occurred while loading the large model.")
+               print("\nPlease try one of the following options:")
+               print("1. Run with medium model on GPU:")
+               print("   python whisper_utils.py -i your_audio.mp3 -m medium")
+               print("2. Run with large model on CPU (slower but more accurate):")
+               print("   python whisper_utils.py -i your_audio.mp3 --device cpu")
+               raise RuntimeError("GPU memory insufficient for current configuration")
            else:
                raise e
 
@@ -155,7 +118,7 @@ class WhisperTranscriber:
        
        Args:
            audio_path: 音声ファイルのパス
-           
+       
        Returns:
            List[AudioSegment]: 分割された音声セグメントのリスト
        """
@@ -171,14 +134,14 @@ class WhisperTranscriber:
        
        Args:
            audio_path: 音声ファイルのパス
-           output_dir: 出力ディレクトリのパス（Noneの場合は入力と同じディレクトリ）
-           
+           output_dir: 出力ディレクトリ（Noneの場合は入力と同じディレクトリ）
+       
        Returns:
            str: 文字起こしされたテキスト
-           
+       
        Raises:
            FileNotFoundError: 音声ファイルが見つからない場合
-           RuntimeError: 音声ファイルの読み込みに失敗した場合
+           RuntimeError: 処理中にエラーが発生した場合
        """
        try:
            if not os.path.exists(audio_path):
@@ -207,29 +170,24 @@ class WhisperTranscriber:
                print(f"Processing chunk {i}/{len(audio_segments)}...")
                chunk_path = os.path.join(temp_dir, f"temp_chunk_{i}.mp3")
                try:
-                   if self.device == "cuda":
-                       self._reset_cuda()
-                       memory_allocated = torch.cuda.memory_allocated(0)
-                       memory_reserved = torch.cuda.memory_reserved(0)
-                       print(f"GPU Memory: Allocated = {memory_allocated/1024**2:.1f}MB, "
-                             f"Reserved = {memory_reserved/1024**2:.1f}MB")
-                   
                    chunk.export(chunk_path, format="mp3")
                    result = self.model.transcribe(chunk_path)
                    transcript += result["text"] + "\n"
                    
                except RuntimeError as e:
                    if "out of memory" in str(e) and self.device == "cuda":
-                       print(f"GPU memory error on chunk {i}, but continuing with current configuration...")
-                       self._reset_cuda()
-                       result = self.model.transcribe(chunk_path)
-                       transcript += result["text"] + "\n"
+                       print("\nGPU memory error occurred during transcription.")
+                       print("\nPlease try one of the following options:")
+                       print("1. Run with medium model on GPU:")
+                       print("   python whisper_utils.py -i your_audio.mp3 -m medium")
+                       print("2. Run with large model on CPU (slower but more accurate):")
+                       print("   python whisper_utils.py -i your_audio.mp3 --device cpu")
+                       raise
                    else:
                        raise e
                finally:
                    if os.path.exists(chunk_path):
                        os.remove(chunk_path)
-                   gc.collect()
 
            filename = os.path.basename(audio_path)
            txt_filename = os.path.splitext(filename)[0] + ".txt"
@@ -252,7 +210,7 @@ class WhisperTranscriber:
        Args:
            audio_dir: 音声ファイルのディレクトリ
            output_dir: 出力ディレクトリ（Noneの場合は入力と同じディレクトリ）
-           
+       
        Raises:
            FileNotFoundError: ディレクトリが見つからない場合
        """
@@ -272,13 +230,14 @@ class WhisperTranscriber:
                    print(f"Completed: {filename}")
                except Exception as e:
                    print(f"Error processing {filename}: {str(e)}")
-                   continue
+                   raise
 
 def main() -> NoReturn:
    """
    メイン実行関数
    
-   コマンドライン引数を解析し、WhisperTranscriberを実行
+   コマンドライン引数を解析し、適切なモードでWhisperTranscriberを実行します。
+   GPU メモリ不足時には代替の実行方法を提案します。
    """
    import argparse
    
