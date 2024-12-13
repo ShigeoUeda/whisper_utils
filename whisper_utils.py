@@ -1,5 +1,3 @@
-# whisper_utils.py
-
 import os
 import warnings
 from pydub import AudioSegment
@@ -41,7 +39,7 @@ class WhisperTranscriber:
        if self.device == "cuda":
            with torch.cuda.device("cuda"):
                torch.cuda.empty_cache()
-           torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024
+           torch.backends.cuda.max_memory_allocated = 4 * 1024 * 1024 * 1024
            print(f"Using device: {self.device} (Memory usage limited to 90%)")
        else:
            print(f"Using device: {self.device}")
