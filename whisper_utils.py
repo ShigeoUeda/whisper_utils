@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 class WhisperTranscriber:
-   def __init__(self, model_size: str = "large", device: Optional[str] = None, chunk_length: int = 60):
+   def __init__(self, model_size: str = "large-v3", device: Optional[str] = None, chunk_length: int = 60):
        """
        WhisperTranscriberの初期化
        
@@ -27,7 +27,7 @@ class WhisperTranscriber:
        """
        # GPUメモリの使用を制限する設定
        if torch.cuda.is_available():
-           torch.cuda.set_per_process_memory_fraction(0.70)  # GPU使用量を70%に制限
+           torch.cuda.set_per_process_memory_fraction(0.7)  # GPU使用量を70%に制限
            torch.cuda.empty_cache()
 
        self.model_size = model_size
