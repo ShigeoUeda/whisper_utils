@@ -17,11 +17,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collectio
 class WhisperTranscriber:
    def __init__(self, model_size: str = "large", device: Optional[str] = None, chunk_length: int = 60):
        if torch.cuda.is_available():
-           with torch.cuda.device("cuda"):
-               torch.cuda.empty_cache()
-               torch.cuda.reset_peak_memory_stats()
-               gc.collect()
-           torch.cuda.set_per_process_memory_fraction(0.9)
+           self._reset_cuda()
            print("Initial GPU memory cleared")
 
        self.model_size = model_size
@@ -37,12 +33,29 @@ class WhisperTranscriber:
 
    def _setup_device(self) -> None:
        if self.device == "cuda":
-           with torch.cuda.device("cuda"):
-               torch.cuda.empty_cache()
-           torch.backends.cuda.max_memory_allocated = 4 * 1024 * 1024 * 1024
+           self._clear_gpu_memory()
+           torch.backends.cuda.max_memory_allocated = 6 * 1024 * 1024 * 1024
            print(f"Using device: {self.device} (Memory usage limited to 90%)")
        else:
            print(f"Using device: {self.device}")
+
+   def _clear_gpu_memory(self) -> None:
+       if torch.cuda.is_available():
+           with torch.cuda.device("cuda"):
+               torch.cuda.empty_cache()
+               torch.cuda.reset_peak_memory_stats()
+               torch.cuda.reset_accumulated_memory_stats()
+               torch.cuda.reset_max_memory_allocated()
+               gc.collect()
+               torch.cuda.synchronize()
+
+   def _reset_cuda(self):
+       if torch.cuda.is_available():
+           self._clear_gpu_memory()
+           current_device = torch.cuda.current_device()
+           torch.cuda.device(current_device)
+           torch.cuda.set_per_process_memory_fraction(0.9)
+           torch.cuda.empty_cache()
 
    def _release_memory(self) -> None:
        if self.model is not None:
@@ -50,19 +63,12 @@ class WhisperTranscriber:
            self.model = None
        gc.collect()
        if self.device == "cuda":
-           with torch.cuda.device("cuda"):
-               torch.cuda.empty_cache()
+           self._clear_gpu_memory()
 
    def load_model(self) -> None:
        self._release_memory()
+       self._reset_cuda()
        
-       if torch.cuda.is_available():
-           with torch.cuda.device("cuda"):
-               torch.cuda.empty_cache()
-               torch.cuda.reset_peak_memory_stats()
-               gc.collect()
-           print("GPU memory cleared before model loading")
-
        initial_device = self.device
        initial_model = self.model_size
        print(f"Attempting to load Whisper {self.model_size} model on {self.device.upper()}...")
@@ -72,8 +78,7 @@ class WhisperTranscriber:
                torch.cuda.set_per_process_memory_fraction(0.9)
            
            with warnings.catch_warnings():
-               warnings.filterwarnings("ignore", category=FutureWarning)
-               warnings.filterwarnings("ignore", category=UserWarning)
+               warnings.filterwarnings("ignore")
                self.model = whisper.load_model(
                    self.model_size, 
                    device=self.device,
@@ -85,10 +90,7 @@ class WhisperTranscriber:
        except RuntimeError as e:
            if "out of memory" in str(e):
                if self.device == "cuda":
-                   with torch.cuda.device("cuda"):
-                       torch.cuda.empty_cache()
-                       torch.cuda.reset_peak_memory_stats()
-                       gc.collect()
+                   self._reset_cuda()
                    
                    if self.model_size == "large":
                        print("GPU memory error with large model. Trying medium model on GPU...")
@@ -140,8 +142,7 @@ class WhisperTranscriber:
                chunk_path = os.path.join(temp_dir, f"temp_chunk_{i}.mp3")
                try:
                    if self.device == "cuda":
-                       with torch.cuda.device("cuda"):
-                           torch.cuda.empty_cache()
+                       self._clear_gpu_memory()
                        memory_allocated = torch.cuda.memory_allocated(0)
                        memory_reserved = torch.cuda.memory_reserved(0)
                        print(f"GPU Memory: Allocated = {memory_allocated/1024**2:.1f}MB, "
@@ -155,8 +156,7 @@ class WhisperTranscriber:
                    if "out of memory" in str(e) and self.device == "cuda":
                        print(f"GPU memory error on chunk {i}, but continuing with current configuration...")
                        self._release_memory()
-                       with torch.cuda.device("cuda"):
-                           torch.cuda.empty_cache()
+                       self._reset_cuda()
                        result = self.model.transcribe(chunk_path)
                        transcript += result["text"] + "\n"
                    else:
